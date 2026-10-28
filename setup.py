@@ -22,7 +22,7 @@ setup(
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='Swarag V S',
-    maintainer_email='swaragvs09@gmail.com',
+    maintainer_email='swaragvs@users.noreply.github.com',
     description='TurtleBot3 Autonomous Navigation and Obstacle Avoidance using Nav2 on ROS 2 Jazzy',
     license='Apache-2.0',
     extras_require={
