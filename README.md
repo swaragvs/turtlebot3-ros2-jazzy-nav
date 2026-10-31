@@ -11,6 +11,8 @@ environment live with SLAM Toolbox.
 
 [![TurtleBot3 Nav2 demo](https://img.youtube.com/vi/YgTTjvmDnQk/0.jpg)](https://youtu.be/YgTTjvmDnQk)
 
+▶️ [Watch the video demonstration on YouTube](https://youtu.be/YgTTjvmDnQk)
+
 ## System architecture
 
 ```mermaid
