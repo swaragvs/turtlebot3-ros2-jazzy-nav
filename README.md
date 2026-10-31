@@ -13,6 +13,10 @@ environment live with SLAM Toolbox.
 
 ▶️ [Watch the video demonstration on YouTube](https://youtu.be/YgTTjvmDnQk)
 
+## Detailed learning and implementation report
+
+📘 [Read the detailed learning and implementation report on Overleaf](https://www.overleaf.com/project/6ae61a7b594dce22ead15141/share#a7477c91721805a48bb192bf671cb207952dc0ddcb81a49c)
+
 ## System architecture
 
 ```mermaid
