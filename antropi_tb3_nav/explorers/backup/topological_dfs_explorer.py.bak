@@ -1,0 +1,735 @@
+#!/usr/bin/env python3
+import json
+import math
+import os
+import time
+
+import numpy as np
+import rclpy
+from action_msgs.msg import GoalStatus
+from geometry_msgs.msg import PoseStamped, Twist
+from nav2_msgs.action import NavigateToPose
+from nav_msgs.msg import OccupancyGrid
+from rclpy.action import ActionClient
+from rclpy.executors import ExternalShutdownException
+from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from sensor_msgs.msg import LaserScan
+from std_msgs.msg import ColorRGBA
+from tf2_ros import Buffer, TransformException, TransformListener
+from visualization_msgs.msg import Marker, MarkerArray
+
+
+class ActiveOrthogonalExplorer(Node):
+    PERCEIVE = 0
+    NAVIGATE = 1
+    DEFERRED = 2
+    REFINE = 3
+    FINISHED = 4
+
+    def __init__(self):
+        super().__init__('topological_dfs_explorer')
+
+        self.declare_parameter('linear_speed', 0.22)
+        self.declare_parameter('angular_speed', 0.55)
+        self.declare_parameter('max_scan_speed', 0.22)
+        self.declare_parameter('robot_radius', 0.105)
+        self.declare_parameter('safety_margin', 0.08)
+        self.declare_parameter('standoff', 0.35)
+        self.declare_parameter('bundle_half_width_deg', 5.0)
+        self.declare_parameter('minimum_branch_depth', 0.40)
+        self.declare_parameter('minimum_goal_distance', 0.50)
+        self.declare_parameter('node_merge_radius', 0.50)
+        self.declare_parameter('grid_size', 0.50)
+        self.declare_parameter('sensed_range', 3.0)
+        self.declare_parameter('visited_path_clearance', 0.75)
+        self.declare_parameter('scan_timeout', 0.5)
+        self.declare_parameter('goal_timeout', 35.0)
+        self.declare_parameter('dynamic_goal_dwell', 2.0)
+        self.declare_parameter('graph_save_path', os.path.expanduser('~/antropi_ws/coverage_graph.json'))
+
+        sensor_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+        )
+        map_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+        self.scan_sub = self.create_subscription(LaserScan, '/scan', self.scan_cb, sensor_qos)
+        self.map_sub = self.create_subscription(OccupancyGrid, '/map', self.map_cb, map_qos)
+        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.marker_pub = self.create_publisher(MarkerArray, '/exploration_graph', 10)
+
+        self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+
+        self.latest_scan = None
+        self.latest_map = None
+        self.last_scan_time = None
+        self.scan_stamp_time = None
+        self.pose = None
+        self.yaw = 0.0
+        self.state = self.PERCEIVE
+        self.goal_handle = None
+        self.goal_in_progress = False
+        self.goal_start_time = 0.0
+        self.goal_target = None
+        self.goal_direction = None
+        self.last_goal_eval = 0.0
+        self.dynamic_goal_dwell_start = time.monotonic()
+
+        self.nodes = []
+        self.edges = []
+        self.stack = []
+        self.failed_targets = set()
+        self.failed_goal_positions = set()
+        self.completed_goals = set()
+        self.visited_goal_positions = set()
+        self.visited_path = []
+        self.active_goal_key = None
+        self.coverage = set()
+        self.visited_cells = set()
+        self.current_node = None
+        self.last_perceive_log = 0.0
+        self.last_progress_pose = None
+        self.last_progress_time = time.monotonic()
+
+        self.timer = self.create_timer(0.1, self.watchdog)
+        self.marker_timer = self.create_timer(1.0, self.publish_markers)
+        self.get_logger().info('Active orthogonal exploration executive initialized')
+
+    def scan_cb(self, msg):
+        self.latest_scan = msg
+        self.last_scan_time = time.monotonic()
+
+    def map_cb(self, msg):
+        self.latest_map = msg
+        self.update_coverage()
+
+    def get_map_pose(self):
+        try:
+            transform = self.tf_buffer.lookup_transform('map', 'base_footprint', rclpy.time.Time())
+            x = transform.transform.translation.x
+            y = transform.transform.translation.y
+            q = transform.transform.rotation
+            yaw = float(math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                                   1.0 - 2.0 * (q.y * q.y + q.z * q.z)))
+            dx = x - self.pose[0] if self.pose else 0.0
+            dy = y - self.pose[1] if self.pose else 0.0
+            if self.pose and math.hypot(dx, dy) > 0.5:
+                self.get_logger().warn('Map-frame pose jumped by %.2f m; revalidating graph.', math.hypot(dx, dy))
+            self.pose = (x, y)
+            self.yaw = yaw
+            sample_distance = 0.20
+            if (not self.visited_path or
+                    math.hypot(
+                        x - self.visited_path[-1][0],
+                        y - self.visited_path[-1][1],
+                    ) >= sample_distance):
+                self.visited_path.append((x, y))
+            return True
+        except TransformException:
+            return False
+
+    def normalize_angle(self, angle):
+        """Normalize scalar or NumPy-array angles to [-pi, pi]."""
+        return np.arctan2(np.sin(angle), np.cos(angle))
+
+    def world_cardinal_yaw(self):
+        return round(self.yaw / (math.pi / 2.0)) * (math.pi / 2.0)
+
+    def goal_is_unvisited(self, x, y, key=None):
+        position = (round(float(x), 2), round(float(y), 2))
+        if key is not None and (
+                key in self.completed_goals or key in self.failed_targets):
+            return False
+        if (position in self.visited_goal_positions or
+                position in self.failed_goal_positions):
+            return False
+
+        clearance = float(self.get_parameter('visited_path_clearance').value)
+        if any(math.hypot(x - path_x, y - path_y) < clearance
+               for path_x, path_y in self.visited_path):
+            return False
+
+        if self.latest_map is not None:
+            info = self.latest_map.info
+            col = math.floor((x - info.origin.position.x) / info.resolution)
+            row = math.floor((y - info.origin.position.y) / info.resolution)
+            if 0 <= row < info.height and 0 <= col < info.width:
+                return (row, col) not in self.visited_cells
+        return True
+
+    def stop(self):
+        self.cmd_pub.publish(Twist())
+
+    def update_coverage(self):
+        if self.latest_map is None or self.pose is None or self.latest_scan is None:
+            return
+        info = self.latest_map.info
+        grid = np.asarray(self.latest_map.data, dtype=np.int8).reshape((info.height, info.width))
+        resolution = info.resolution
+        origin_x = info.origin.position.x
+        origin_y = info.origin.position.y
+        px, py = self.pose
+
+        def world_to_cell(wx, wy):
+            c = int((wx - origin_x) / resolution)
+            r = int((wy - origin_y) / resolution)
+            if 0 <= r < info.height and 0 <= c < info.width:
+                return r, c
+            return None
+
+        cell = world_to_cell(px, py)
+        if cell:
+            for dr in range(-1, 2):
+                for dc in range(-1, 2):
+                    rr, cc = cell[0] + dr, cell[1] + dc
+                    if 0 <= rr < info.height and 0 <= cc < info.width and grid[rr, cc] == 0:
+                        key = (rr, cc)
+                        self.visited_cells.add(key)
+                        self.coverage.add(key)
+
+        sensed_range = float(self.get_parameter('sensed_range').value)
+        ranges = np.asarray(self.latest_scan.ranges, dtype=np.float32)
+        angles = self.latest_scan.angle_min + np.arange(len(ranges)) * self.latest_scan.angle_increment
+        valid = np.isfinite(ranges) & (ranges > 0.05) & (ranges <= sensed_range)
+        for r, angle in zip(ranges[valid], angles[valid]):
+            gx = px + r * math.cos(self.yaw + angle)
+            gy = py + r * math.sin(self.yaw + angle)
+            steps = max(1, int(r / max(resolution * 0.5, 0.05)))
+            for step in range(steps + 1):
+                t = step / steps
+                wx = px + t * (gx - px)
+                wy = py + t * (gy - py)
+                result = world_to_cell(wx, wy)
+                if result:
+                    rr, cc = result
+                    if grid[rr, cc] == 0:
+                        self.coverage.add((rr, cc))
+
+    def ray_bundle_candidates(self):
+        if self.latest_scan is None or self.pose is None:
+            return []
+        msg = self.latest_scan
+        ranges = np.asarray(msg.ranges, dtype=np.float32)
+        angles = msg.angle_min + np.arange(len(ranges)) * msg.angle_increment
+        finite = np.isfinite(ranges)
+        half_width = math.radians(float(self.get_parameter('bundle_half_width_deg').value))
+        safety = float(self.get_parameter('robot_radius').value) + float(self.get_parameter('safety_margin').value)
+        standoff = float(self.get_parameter('standoff').value)
+        range_limit = min(float(msg.range_max), 3.5)
+        base_yaw = self.world_cardinal_yaw()
+        candidates = []
+
+        for direction_index, local_angle in enumerate((0.0, math.pi / 2.0, -math.pi / 2.0, math.pi)):
+            global_heading = self.normalize_angle(base_yaw + local_angle)
+            relative = np.asarray([self.normalize_angle(a) for a in angles])
+            # Align each LiDAR ray to the current world-cardinal heading.
+            world_rays = self.normalize_angle(self.yaw + relative)
+            delta = np.abs(np.asarray(self.normalize_angle(world_rays - global_heading)))
+            wedge = (delta <= half_width)
+            usable = wedge & finite & (ranges > 0.05) & (ranges <= range_limit)
+            if np.count_nonzero(usable) < max(5, int((2.0 * half_width / msg.angle_increment))):
+                continue
+
+            wedge_ranges = ranges[usable]
+            wedge_angles = world_rays[usable]
+            depth = float(np.percentile(wedge_ranges, 25))
+            if depth < safety + standoff or depth < float(self.get_parameter('minimum_branch_depth').value):
+                continue
+
+            # Narrow-gap rejection: every ray within the robot-width bundle must fit.
+            target_error = safety / max(depth, 0.20)
+            if len(wedge_angles) < 3:
+                continue
+            angular_span = abs(wedge_angles[-1] - wedge_angles[0])
+            if angular_span < target_error and depth < 1.5:
+                continue
+
+            goal_depth = max(safety, depth - standoff)
+            gx = self.pose[0] + goal_depth * math.cos(global_heading)
+            gy = self.pose[1] + goal_depth * math.sin(global_heading)
+            movement = math.hypot(gx - self.pose[0], gy - self.pose[1])
+            minimum_movement = float(self.get_parameter('minimum_goal_distance').value)
+            if movement < minimum_movement:
+                continue
+            key = (round(gx, 2), round(gy, 2), round(math.degrees(global_heading) / 90.0) * 90)
+            if not self.goal_is_unvisited(gx, gy, key):
+                continue
+            candidates.append({
+                'heading': global_heading,
+                'direction': direction_index,
+                'depth': depth,
+                'goal': (gx, gy),
+                'key': key,
+            })
+        candidates.sort(key=lambda item: item['depth'], reverse=True)
+        return candidates
+
+    def add_or_merge_node(self, node_type='junction'):
+        if self.pose is None:
+            return None
+        merge_radius = float(self.get_parameter('node_merge_radius').value)
+        nearest = None
+        nearest_distance = merge_radius
+        for node in self.nodes:
+            distance = math.hypot(node['x'] - self.pose[0], node['y'] - self.pose[1])
+            if distance < nearest_distance:
+                nearest = node
+                nearest_distance = distance
+        if nearest is not None:
+            nearest['visits'] += 1
+            self.current_node = nearest
+            return nearest
+
+        node = {'id': len(self.nodes), 'x': self.pose[0], 'y': self.pose[1],
+                'type': node_type, 'visits': 1, 'branches': {}}
+        self.nodes.append(node)
+        if len(self.nodes) > 1 and self.current_node is not None:
+            edge = (self.current_node['id'], node['id'])
+            if edge not in self.edges and (edge[1], edge[0]) not in self.edges:
+                self.edges.append(edge)
+        self.current_node = node
+        return node
+
+    def send_goal(self, x, y, heading=None):
+        if not self.nav_client.wait_for_server(timeout_sec=0.5):
+            self.get_logger().warn('navigate_to_pose action server unavailable')
+            return False
+        if heading is None:
+            heading = self.world_cardinal_yaw()
+        goal = NavigateToPose.Goal()
+        goal.pose = PoseStamped()
+        goal.pose.header.frame_id = 'map'
+        goal.pose.header.stamp = self.get_clock().now().to_msg()
+        goal.pose.pose.position.x = float(x)
+        goal.pose.pose.position.y = float(y)
+        goal.pose.pose.position.z = 0.0
+        goal.pose.pose.orientation.x = 0.0
+        goal.pose.pose.orientation.y = 0.0
+        goal.pose.pose.orientation.z = math.sin(heading / 2.0)
+        goal.pose.pose.orientation.w = math.cos(heading / 2.0)
+        send_future = self.nav_client.send_goal_async(goal)
+        send_future.add_done_callback(self.goal_response_callback)
+        self.goal_start_time = time.monotonic()
+        self.goal_in_progress = True
+        self.active_goal_key = (round(float(x), 2), round(float(y), 2),
+                                round(math.degrees(heading) / 90.0) * 90)
+        return True
+
+    def goal_response_callback(self, future):
+        try:
+            handle = future.result()
+        except Exception as exc:
+            self.get_logger().error(f'Failed to send Nav2 goal: {exc}')
+            self.abandon_active_goal()
+            return
+        if not handle.accepted:
+            self.get_logger().warn('Nav2 rejected exploration goal')
+            self.abandon_active_goal()
+            return
+        self.goal_handle = handle
+        result_future = handle.get_result_async()
+        result_future.add_done_callback(self.goal_result_callback)
+
+    def abandon_active_goal(self):
+        """Clear failed goal state and flag its branch for recovery."""
+        self.goal_in_progress = False
+        self.goal_handle = None
+        if self.active_goal_key is not None:
+            self.failed_targets.add(self.active_goal_key)
+            self.failed_goal_positions.add(self.active_goal_key[:2])
+        if (self.goal_target is not None and
+                self.goal_target.get('is_branch', False)):
+            target_node = next(
+                (node for node in self.nodes
+                 if node['id'] == self.goal_target['node_id']),
+                None,
+            )
+            if target_node is not None:
+                direction = round(
+                    math.degrees(self.goal_target['heading']) / 90.0
+                ) * 90
+                target_node['branches'][direction] = 'BLOCKED'
+        self.goal_target = None
+        self.active_goal_key = None
+        self.state = self.PERCEIVE
+
+    def goal_result_callback(self, future):
+        self.goal_in_progress = False
+        self.goal_handle = None
+        navigation_succeeded = False
+        if self.state == self.NAVIGATE:
+            try:
+                result = future.result()
+                navigation_succeeded = result.status == GoalStatus.STATUS_SUCCEEDED
+                self.get_logger().info(f'Navigation result status: {result.status}')
+            except Exception as exc:
+                self.get_logger().warn(f'Navigation goal failed: {exc}')
+
+        if navigation_succeeded and self.active_goal_key is not None:
+            self.completed_goals.add(self.active_goal_key)
+            self.visited_goal_positions.add(self.active_goal_key[:2])
+        elif self.active_goal_key is not None:
+            self.failed_targets.add(self.active_goal_key)
+            self.failed_goal_positions.add(self.active_goal_key[:2])
+        if (self.goal_target is not None and
+                self.goal_target.get('is_branch', False)):
+            direction_key = round(
+                math.degrees(self.goal_target['heading']) / 90.0
+            ) * 90
+            node_id = self.goal_target.get('node_id')
+            target_node = next(
+                (node for node in self.nodes if node['id'] == node_id),
+                self.current_node,
+            )
+            if target_node is not None:
+                target_node['branches'][direction_key] = (
+                    'DONE' if navigation_succeeded else 'BLOCKED'
+                )
+        self.goal_target = None
+        self.active_goal_key = None
+        self.state = self.PERCEIVE
+
+    def cancel_goal(self, reason):
+        if self.goal_handle is not None and self.goal_in_progress:
+            self.get_logger().warn(reason)
+            cancel_future = self.goal_handle.cancel_goal_async()
+            cancel_future.add_done_callback(lambda future: None)
+        self.goal_in_progress = False
+        self.stop()
+
+    def perceived_uncovered_frontier(self):
+        if self.latest_map is None:
+            return None
+        info = self.latest_map.info
+        grid = np.asarray(self.latest_map.data, dtype=np.int8).reshape((info.height, info.width))
+        free = grid == 0
+        unknown = grid == -1
+        candidates = []
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if dr == 0 and dc == 0:
+                    continue
+                neighbors = np.roll(np.roll(unknown, dr, axis=0), dc, axis=1)
+                frontier_mask = free & neighbors
+                rows, cols = np.where(frontier_mask)
+                for row, col in zip(rows, cols):
+                    key = (row, col)
+                    if key in self.visited_cells:
+                        continue
+                    x = info.origin.position.x + (col + 0.5) * info.resolution
+                    y = info.origin.position.y + (row + 0.5) * info.resolution
+                    if not self.goal_is_unvisited(x, y):
+                        continue
+                    if self.pose is not None:
+                        path_distance = math.hypot(x - self.pose[0], y - self.pose[1])
+                        if path_distance < 0.3:
+                            continue
+                        if 7.0 < path_distance:
+                            continue
+                        candidates.append((path_distance, x, y))
+        if not candidates:
+            return None
+        candidates.sort()
+        return candidates[0][1:]
+
+    def coverage_gap_targets(self):
+        """Return free cells bracketed by coverage along map rows and columns.
+
+        Sample targets at the configured grid interval.
+        """
+        if self.latest_map is None or self.pose is None or not self.coverage:
+            return []
+
+        info = self.latest_map.info
+        grid = np.asarray(self.latest_map.data, dtype=np.int8).reshape(
+            (info.height, info.width)
+        )
+        resolution = info.resolution
+        grid_size = float(self.get_parameter('grid_size').value)
+        spacing = max(1, int(round(grid_size / resolution)))
+        covered_by_row = {}
+        covered_by_column = {}
+        for row, col in self.coverage:
+            if 0 <= row < info.height and 0 <= col < info.width:
+                covered_by_row.setdefault(row, []).append(col)
+                covered_by_column.setdefault(col, []).append(row)
+
+        target_cells = set()
+
+        def add_gaps(lines, along_rows):
+            for fixed, covered_indices in lines.items():
+                indices = sorted(set(covered_indices))
+                for start, end in zip(indices, indices[1:]):
+                    first = start + 1
+                    if first >= end:
+                        continue
+                    for chunk_start in range(first, end, spacing):
+                        chunk_end = min(end, chunk_start + spacing)
+                        free_indices = []
+                        for varying in range(chunk_start, chunk_end):
+                            row, col = ((fixed, varying) if along_rows
+                                        else (varying, fixed))
+                            if (grid[row, col] == 0 and
+                                    (row, col) not in self.coverage):
+                                free_indices.append(varying)
+                        if free_indices:
+                            varying = free_indices[len(free_indices) // 2]
+                            row, col = ((fixed, varying) if along_rows
+                                        else (varying, fixed))
+                            target_cells.add((row, col))
+
+        add_gaps(covered_by_row, True)
+        add_gaps(covered_by_column, False)
+
+        targets = []
+        for row, col in target_cells:
+            if (row, col) in self.visited_cells:
+                continue
+            x = info.origin.position.x + (col + 0.5) * resolution
+            y = info.origin.position.y + (row + 0.5) * resolution
+            if self.goal_is_unvisited(x, y):
+                distance = math.hypot(x - self.pose[0], y - self.pose[1])
+                targets.append((distance, x, y))
+        targets.sort()
+        return [(x, y) for _, x, y in targets]
+
+    def queue_deferred_candidates(self, candidates):
+        """Save alternate directions without interrupting the active goal."""
+        if self.current_node is None:
+            return
+        active_direction = None
+        if self.goal_in_progress:
+            active_direction = round(
+                math.degrees(self.goal_direction or 0.0) / 90.0
+            ) * 90
+        queued_positions = {
+            (round(branch['goal'][0], 2), round(branch['goal'][1], 2))
+            for branch in self.stack
+        }
+        for candidate in reversed(candidates):
+            direction = round(math.degrees(candidate['heading']) / 90.0) * 90
+            if direction == active_direction:
+                continue
+            x, y = candidate['goal']
+            goal_key = (round(x, 2), round(y, 2), direction)
+            position = (goal_key[0], goal_key[1])
+            if position in queued_positions or not self.goal_is_unvisited(x, y, goal_key):
+                continue
+            self.current_node['branches'].setdefault(direction, 'UNVISITED')
+            self.stack.append({
+                'goal': (x, y),
+                'heading': candidate['heading'],
+                'node_id': self.current_node['id'],
+                'depth': candidate['depth'],
+                'is_branch': True,
+            })
+            queued_positions.add(position)
+
+    def watchdog(self):
+        now_wall = time.monotonic()
+        if not self.get_map_pose():
+            self.stop()
+            return
+
+        if self.latest_scan is None or self.last_scan_time is None:
+            self.stop()
+            return
+        scan_age = now_wall - self.last_scan_time
+        if scan_age > float(self.get_parameter('scan_timeout').value):
+            self.cancel_goal('LiDAR scan stale; stopping and cancelling Nav2 goal')
+            return
+
+        if self.goal_in_progress:
+            if now_wall - self.goal_start_time > float(self.get_parameter('goal_timeout').value):
+                self.cancel_goal(
+                    'Exploration goal timed out; marking target unavailable'
+                )
+                if (self.goal_target is not None and
+                        self.goal_target.get('is_branch', False)):
+                    target_node = next(
+                        (node for node in self.nodes
+                         if node['id'] == self.goal_target['node_id']),
+                        None,
+                    )
+                    if target_node is not None:
+                        key = round(math.degrees(self.goal_direction or 0.0) / 90.0) * 90
+                        target_node['branches'][key] = 'BLOCKED'
+                if self.active_goal_key is not None:
+                    self.failed_targets.add(self.active_goal_key)
+                    self.failed_goal_positions.add(self.active_goal_key[:2])
+                return
+
+            if now_wall - self.dynamic_goal_dwell_start > float(self.get_parameter('dynamic_goal_dwell').value):
+                candidates = self.ray_bundle_candidates()
+                self.queue_deferred_candidates(candidates)
+                self.dynamic_goal_dwell_start = now_wall
+
+            return
+
+        if self.state == self.PERCEIVE:
+            self.choose_and_navigate()
+        elif self.state == self.DEFERRED:
+            self.dispatch_deferred_goal()
+        elif self.state == self.REFINE:
+            self.refinement_step()
+        elif self.state == self.FINISHED:
+            self.stop()
+
+    def choose_and_navigate(self):
+        candidates = self.ray_bundle_candidates()
+        node = self.add_or_merge_node('junction' if len(candidates) > 1 else 'corridor') if candidates else None
+        eligible = candidates
+
+        if eligible:
+            self.queue_deferred_candidates(eligible[1:])
+            chosen = eligible[0]
+            key = round(math.degrees(chosen['heading']) / 90.0) * 90
+            if node is not None:
+                node['branches'][key] = 'ACTIVE'
+            gx, gy = chosen['goal']
+            self.goal_target = dict(
+                chosen,
+                node_id=node['id'] if node is not None else 0,
+                is_branch=True,
+            )
+            self.goal_direction = chosen['heading']
+            self.dynamic_goal_dwell_start = time.monotonic()
+            if self.send_goal(gx, gy, chosen['heading']):
+                self.state = self.NAVIGATE
+            return
+
+        if self.stack:
+            self.state = self.DEFERRED
+        else:
+            self.state = self.REFINE
+
+    def dispatch_deferred_goal(self):
+        if not self.stack:
+            self.state = self.REFINE
+            return
+
+        branch = self.stack.pop()
+        gx, gy = branch['goal']
+        goal_key = (
+            round(gx, 2),
+            round(gy, 2),
+            round(math.degrees(branch['heading']) / 90.0) * 90,
+        )
+        if not self.goal_is_unvisited(gx, gy, goal_key):
+            self.state = self.DEFERRED if self.stack else self.REFINE
+            return
+
+        target_node = next(
+            (node for node in self.nodes if node['id'] == branch['node_id']),
+            None,
+        )
+        direction = round(math.degrees(branch['heading']) / 90.0) * 90
+        if target_node is not None:
+            target_node['branches'][direction] = 'ACTIVE'
+        self.goal_target = branch
+        self.goal_direction = branch['heading']
+        self.dynamic_goal_dwell_start = time.monotonic()
+        if self.send_goal(gx, gy, branch['heading']):
+            self.state = self.NAVIGATE
+        else:
+            self.state = self.DEFERRED if self.stack else self.REFINE
+
+    def refinement_step(self):
+        gap_targets = self.coverage_gap_targets()
+        frontier = gap_targets[0] if gap_targets else self.perceived_uncovered_frontier()
+        if frontier is None:
+            self.save_graph()
+            self.stop()
+            self.get_logger().info('Exploration complete; no remaining map frontiers or coverage gaps.')
+            self.state = self.FINISHED
+            return
+        x, y = frontier
+        heading = math.atan2(y - self.pose[1], x - self.pose[0])
+        heading = round(heading / (math.pi / 2.0)) * (math.pi / 2.0)
+        refinement_goal = {'goal': (x, y), 'heading': heading, 'node_id': self.current_node['id'] if self.current_node else 0, 'depth': 0.0}
+        self.goal_target = refinement_goal
+        self.goal_direction = heading
+        if self.send_goal(x, y, heading):
+            self.state = self.NAVIGATE
+
+    def save_graph(self):
+        path = str(self.get_parameter('graph_save_path').value)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        payload = {
+            'nodes': self.nodes,
+            'edges': self.edges,
+            'coverage_cells': [[r, c] for r, c in sorted(self.coverage)],
+        }
+        with open(path, 'w', encoding='utf-8') as graph_file:
+            json.dump(payload, graph_file, indent=2)
+        self.get_logger().info(f'Saved exploration graph to {path}')
+
+    def publish_markers(self):
+        markers = MarkerArray()
+        delete_all = Marker()
+        delete_all.action = Marker.DELETEALL
+        markers.markers.append(delete_all)
+
+        nodes_marker = Marker()
+        nodes_marker.header.frame_id = 'map'
+        nodes_marker.header.stamp = self.get_clock().now().to_msg()
+        nodes_marker.ns = 'exploration_nodes'
+        nodes_marker.id = 1
+        nodes_marker.type = Marker.SPHERE_LIST
+        nodes_marker.action = Marker.ADD
+        nodes_marker.scale.x = nodes_marker.scale.y = nodes_marker.scale.z = 0.18
+        nodes_marker.color = ColorRGBA(r=0.1, g=0.8, b=0.9, a=0.9)
+        from geometry_msgs.msg import Point
+        nodes_marker.points = [Point(x=float(n['x']), y=float(n['y']), z=0.1) for n in self.nodes]
+        markers.markers.append(nodes_marker)
+
+        edge_marker = Marker()
+        edge_marker.header.frame_id = 'map'
+        edge_marker.header.stamp = nodes_marker.header.stamp
+        edge_marker.ns = 'exploration_edges'
+        edge_marker.id = 2
+        edge_marker.type = Marker.LINE_LIST
+        edge_marker.action = Marker.ADD
+        edge_marker.scale.x = 0.035
+        edge_marker.color = ColorRGBA(r=1.0, g=0.65, b=0.0, a=0.9)
+        for a, b in self.edges:
+            na = next((n for n in self.nodes if n['id'] == a), None)
+            nb = next((n for n in self.nodes if n['id'] == b), None)
+            if na is not None and nb is not None:
+                edge_marker.points.extend([
+                    Point(x=float(na['x']), y=float(na['y']), z=0.08),
+                    Point(x=float(nb['x']), y=float(nb['y']), z=0.08),
+                ])
+        markers.markers.append(edge_marker)
+        self.marker_pub.publish(markers)
+
+
+# Backward-compatible executable class name.
+TopologicalDFSExplorer = ActiveOrthogonalExplorer
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = ActiveOrthogonalExplorer()
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        node.stop()
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
